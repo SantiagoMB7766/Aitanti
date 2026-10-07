@@ -1,0 +1,28 @@
+/target/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+*.seed
+
+# Aitanti sensitive local data
+*.vault
+*.aitanti-vault
+vault-data/
+local-data/
+
+# Logs must never contain secrets; keep runtime logs out of Git anyway
+*.log
+logs/

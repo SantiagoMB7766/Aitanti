@@ -1,0 +1,8 @@
+[package]
+name = "aitanti-agent-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aitanti-protocol = { path = "../protocol" }
