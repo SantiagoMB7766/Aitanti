@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::fmt;
 
+pub const PROTOCOL_VERSION: u16 = 1;
 pub const AUTH_DOMAIN: &[u8] = b"aitanti/auth";
 pub const AUTH_CHALLENGE_LEN: usize = 32;
 
@@ -60,7 +61,22 @@ impl AuthRequest {
         })
     }
 
-    /// Returns the canonical bytes that will later be signed.
+    #[must_use]
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    #[must_use]
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    #[must_use]
+    pub fn challenge(&self) -> [u8; AUTH_CHALLENGE_LEN] {
+        self.challenge
+    }
+
+    /// Returns the canonical bytes that are signed for authentication.
     ///
     /// Layout:
     ///
@@ -71,6 +87,7 @@ impl AuthRequest {
     /// service      : UTF-8 bytes
     /// challenge    : 32 bytes
     /// ```
+    #[must_use]
     pub fn signing_bytes(&self) -> Vec<u8> {
         // Safe because `new` rejects services that do not fit in u16.
         let service_len = self.service.len() as u16;
@@ -98,7 +115,8 @@ mod tests {
     use super::*;
 
     fn request(service: &str, challenge: [u8; 32]) -> AuthRequest {
-        AuthRequest::new(1, service.to_owned(), challenge).expect("test request should be valid")
+        AuthRequest::new(PROTOCOL_VERSION, service.to_owned(), challenge)
+            .expect("test request should be valid")
     }
 
     #[test]
@@ -138,7 +156,7 @@ mod tests {
 
     #[test]
     fn empty_service_is_rejected() {
-        let result = AuthRequest::new(1, String::new(), [1u8; 32]);
+        let result = AuthRequest::new(PROTOCOL_VERSION, String::new(), [1u8; 32]);
 
         assert_eq!(result, Err(ProtocolError::EmptyService));
     }
@@ -147,7 +165,7 @@ mod tests {
     fn service_too_long_is_rejected() {
         let service = "a".repeat(usize::from(u16::MAX) + 1);
 
-        let result = AuthRequest::new(1, service, [1u8; 32]);
+        let result = AuthRequest::new(PROTOCOL_VERSION, service, [1u8; 32]);
 
         assert_eq!(
             result,
@@ -159,14 +177,18 @@ mod tests {
 
     #[test]
     fn canonical_encoding_has_expected_layout() {
-        let request = AuthRequest::new(1, "abc".to_owned(), [0xAA; AUTH_CHALLENGE_LEN])
-            .expect("test request should be valid");
+        let request = AuthRequest::new(
+            PROTOCOL_VERSION,
+            "abc".to_owned(),
+            [0xAA; AUTH_CHALLENGE_LEN],
+        )
+        .expect("test request should be valid");
 
         let bytes = request.signing_bytes();
 
         let mut expected = Vec::new();
         expected.extend_from_slice(b"aitanti/auth");
-        expected.extend_from_slice(&1u16.to_be_bytes());
+        expected.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
         expected.extend_from_slice(&3u16.to_be_bytes());
         expected.extend_from_slice(b"abc");
         expected.extend_from_slice(&[0xAA; AUTH_CHALLENGE_LEN]);

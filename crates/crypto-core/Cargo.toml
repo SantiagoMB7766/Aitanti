@@ -1,0 +1,9 @@
+[package]
+name = "aitanti-crypto-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+aitanti-protocol = { path = "../protocol" }
+aws-lc-rs = "1.18.1"
