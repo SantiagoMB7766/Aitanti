@@ -1,8 +1,12 @@
 [package]
 name = "aitanti-mock-server"
 version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
+edition = "2024"
+publish = false
 
 [dependencies]
+aitanti-crypto-core = { path = "../crypto-core" }
 aitanti-protocol = { path = "../protocol" }
+
+[dev-dependencies]
+aitanti-crypto-core = { path = "../crypto-core" }

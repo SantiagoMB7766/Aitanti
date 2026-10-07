@@ -1,8 +1,8 @@
 [package]
 name = "aitanti-agent-cli"
 version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
+edition = "2024"
+publish = false
 
 [dependencies]
-aitanti-protocol = { path = "../protocol" }
+aitanti-crypto-core = { path = "../crypto-core" }
