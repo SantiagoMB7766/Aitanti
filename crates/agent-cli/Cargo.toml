@@ -1,8 +1,14 @@
 [package]
 name = "aitanti-agent-cli"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]
 aitanti-crypto-core = { path = "../crypto-core" }
+aitanti-mock-server = { path = "../mock-server" }
+aitanti-agent-core = { path = "../agent-core" }
+aitanti-vault = { path = "../vault" }
+rpassword = "7.5.4"
+zeroize = "1.9.0"
