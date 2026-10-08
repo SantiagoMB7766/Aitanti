@@ -1,10 +1,9 @@
 [package]
-name = "aitanti-crypto-core"
+name = "aitanti-agent-core"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
-aitanti-protocol = { path = "../protocol" }
-aws-lc-rs = "1.18.1"
+aitanti-vault = { path = "../vault" }

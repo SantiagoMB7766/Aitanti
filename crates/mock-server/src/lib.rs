@@ -1,14 +1,16 @@
 //! In-memory relying-party server used by the Aitanti MVP.
 //!
-//! The server stores public keys and one-time challenges only. It never
-//! receives or stores client private keys.
+//! The server stores public keys, one-time challenges and demo session tokens
+//! in memory only. It never receives or stores client private keys.
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
-use aitanti_crypto_core::{CryptoError, generate_challenge, verify_auth_signature};
-use aitanti_protocol::{AuthRequest, PROTOCOL_VERSION, ProtocolError};
+use aitanti_crypto_core::{
+    CryptoError, generate_challenge, verify_auth_signature, verify_session_signature,
+};
+use aitanti_protocol::{AuthRequest, PROTOCOL_VERSION, ProtocolError, SessionProofRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PendingChallenge {
@@ -25,6 +27,9 @@ pub enum ServerError {
     UnsupportedProtocolVersion { received: u16 },
     ChallengeUnknownOrConsumed,
     ChallengeGenerationFailed,
+    UnknownSession,
+    SessionServiceMismatch,
+    SessionChallengeUnknownOrConsumed,
     Protocol(ProtocolError),
     Crypto(CryptoError),
 }
@@ -43,6 +48,11 @@ impl fmt::Display for ServerError {
                 write!(f, "challenge is unknown or already consumed")
             }
             Self::ChallengeGenerationFailed => write!(f, "challenge generation failed"),
+            Self::UnknownSession => write!(f, "unknown session"),
+            Self::SessionServiceMismatch => write!(f, "session service does not match proof"),
+            Self::SessionChallengeUnknownOrConsumed => {
+                write!(f, "session challenge unknown or already consumed")
+            }
             Self::Protocol(err) => write!(f, "protocol error: {err}"),
             Self::Crypto(err) => write!(f, "cryptographic error: {err}"),
         }
@@ -67,6 +77,15 @@ impl From<CryptoError> for ServerError {
 pub struct MockServer {
     public_keys: HashMap<String, Vec<u8>>,
     pending_challenges: HashSet<PendingChallenge>,
+    sessions: HashMap<[u8; 32], String>,
+    pending_session_proofs: HashSet<SessionChallenge>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SessionChallenge {
+    token: [u8; 32],
+    action: String,
+    challenge: [u8; 32],
 }
 
 impl MockServer {
@@ -161,6 +180,106 @@ impl MockServer {
     }
 }
 
+impl MockServer {
+    /// Authenticates a registered per-service key before minting a 256-bit
+    /// bearer token. Possession of that token ALONE does not authorize any
+    /// sensitive operation in this demo.
+    pub fn login(
+        &mut self,
+        request: &AuthRequest,
+        signature: &[u8],
+    ) -> Result<[u8; 32], ServerError> {
+        self.verify_auth(request, signature)?;
+        for _ in 0..3 {
+            let token = generate_challenge().map_err(|_| ServerError::ChallengeGenerationFailed)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.sessions.entry(token) {
+                entry.insert(request.service().to_owned());
+                return Ok(token);
+            }
+        }
+        Err(ServerError::ChallengeGenerationFailed)
+    }
+
+    /// Ends a demo session and invalidates all unused operation challenges.
+    /// A revoked session token cannot authorize an action, even with a signature.
+    pub fn revoke_session(&mut self, token: [u8; 32]) -> Result<(), ServerError> {
+        self.sessions
+            .remove(&token)
+            .ok_or(ServerError::UnknownSession)?;
+        self.pending_session_proofs
+            .retain(|challenge| challenge.token != token);
+        Ok(())
+    }
+
+    /// Issues a one-time challenge for one exact session and action.
+    pub fn issue_session_challenge(
+        &mut self,
+        token: [u8; 32],
+        action: &str,
+    ) -> Result<SessionProofRequest, ServerError> {
+        let service = self
+            .sessions
+            .get(&token)
+            .ok_or(ServerError::UnknownSession)?
+            .clone();
+        for _ in 0..3 {
+            let challenge =
+                generate_challenge().map_err(|_| ServerError::ChallengeGenerationFailed)?;
+            let request = SessionProofRequest::new(
+                PROTOCOL_VERSION,
+                service.clone(),
+                token,
+                action.to_owned(),
+                challenge,
+            )?;
+            if self.pending_session_proofs.insert(SessionChallenge {
+                token,
+                action: action.to_owned(),
+                challenge,
+            }) {
+                return Ok(request);
+            }
+        }
+        Err(ServerError::ChallengeGenerationFailed)
+    }
+
+    /// Verifies token + signed action proof + fresh challenge + registered
+    /// public key. A failed proof cannot burn the legitimate nonce.
+    pub fn execute_sensitive(
+        &mut self,
+        request: &SessionProofRequest,
+        signature: &[u8],
+    ) -> Result<(), ServerError> {
+        if request.version() != PROTOCOL_VERSION {
+            return Err(ServerError::UnsupportedProtocolVersion {
+                received: request.version(),
+            });
+        }
+        let registered_service = self
+            .sessions
+            .get(&request.token())
+            .ok_or(ServerError::UnknownSession)?;
+        if registered_service != request.service() {
+            return Err(ServerError::SessionServiceMismatch);
+        }
+        let pending = SessionChallenge {
+            token: request.token(),
+            action: request.action().to_owned(),
+            challenge: request.challenge(),
+        };
+        if !self.pending_session_proofs.contains(&pending) {
+            return Err(ServerError::SessionChallengeUnknownOrConsumed);
+        }
+        let public_key = self
+            .public_keys
+            .get(request.service())
+            .ok_or(ServerError::UnregisteredService)?;
+        verify_session_signature(public_key, request, signature)?;
+        self.pending_session_proofs.remove(&pending);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +354,122 @@ mod tests {
         assert_eq!(
             server.register_service("service-a.local", second.public_key_sec1()),
             Err(ServerError::ServiceAlreadyRegistered)
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use aitanti_crypto_core::ServiceKey;
+
+    fn logged_in() -> (ServiceKey, MockServer, [u8; 32]) {
+        let key = ServiceKey::generate("service-a.local").expect("key");
+        let mut server = MockServer::new();
+        server
+            .register_service("service-a.local", key.public_key_sec1())
+            .expect("register");
+        let auth = server
+            .issue_challenge("service-a.local")
+            .expect("auth challenge");
+        let signature = key.sign_auth(&auth).expect("sign auth");
+        let token = server.login(&auth, &signature).expect("login");
+        (key, server, token)
+    }
+
+    #[test]
+    fn stolen_token_alone_cannot_authorize_action() {
+        let (_key, mut server, token) = logged_in();
+        let proof = server
+            .issue_session_challenge(token, "transfer")
+            .expect("proof challenge");
+        assert!(matches!(
+            server.execute_sensitive(&proof, &[]),
+            Err(ServerError::Crypto(CryptoError::VerificationFailed))
+        ));
+    }
+
+    #[test]
+    fn signed_proof_is_one_time_and_action_bound() {
+        let (key, mut server, token) = logged_in();
+        let proof = server
+            .issue_session_challenge(token, "transfer")
+            .expect("challenge");
+        let sig = key.sign_session(&proof).expect("sign");
+        server.execute_sensitive(&proof, &sig).expect("valid proof");
+        assert!(matches!(
+            server.execute_sensitive(&proof, &sig),
+            Err(ServerError::SessionChallengeUnknownOrConsumed)
+        ));
+        let second = server
+            .issue_session_challenge(token, "read")
+            .expect("challenge 2");
+        assert!(matches!(
+            server.execute_sensitive(&second, &sig),
+            Err(ServerError::Crypto(CryptoError::VerificationFailed))
+        ));
+    }
+
+    #[test]
+    fn attacker_private_key_cannot_authorize_action() {
+        let (key, mut server, token) = logged_in();
+        let attacker = ServiceKey::generate("service-a.local").expect("other key");
+        let proof = server
+            .issue_session_challenge(token, "transfer")
+            .expect("challenge");
+        let bad_sig = attacker.sign_session(&proof).expect("bad sign");
+        assert!(matches!(
+            server.execute_sensitive(&proof, &bad_sig),
+            Err(ServerError::Crypto(CryptoError::VerificationFailed))
+        ));
+        server
+            .execute_sensitive(&proof, &key.sign_session(&proof).expect("good sign"))
+            .expect("challenge still valid");
+    }
+
+    #[test]
+    fn unauthorized_token_is_not_a_session() {
+        let (_key, mut server, _token) = logged_in();
+        assert!(matches!(
+            server.issue_session_challenge([0u8; 32], "transfer"),
+            Err(ServerError::UnknownSession)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod revocation_tests {
+    use super::*;
+    use aitanti_crypto_core::ServiceKey;
+
+    #[test]
+    fn revoked_session_rejects_signed_pending_action() {
+        let key = ServiceKey::generate("service-a.local").expect("generate key");
+        let mut server = MockServer::new();
+        server
+            .register_service("service-a.local", key.public_key_sec1())
+            .expect("register");
+        let auth = server
+            .issue_challenge("service-a.local")
+            .expect("challenge");
+        let auth_sig = key.sign_auth(&auth).expect("sign auth");
+        let token = server.login(&auth, &auth_sig).expect("login");
+        let request = server
+            .issue_session_challenge(token, "transfer")
+            .expect("challenge");
+        let signature = key.sign_session(&request).expect("sign operation");
+        server.revoke_session(token).expect("revoke");
+        assert_eq!(
+            server.execute_sensitive(&request, &signature),
+            Err(ServerError::UnknownSession)
+        );
+        assert_eq!(
+            server.revoke_session(token),
+            Err(ServerError::UnknownSession)
+        );
+        assert_eq!(
+            server.issue_session_challenge(token, "transfer"),
+            Err(ServerError::UnknownSession)
         );
     }
 }

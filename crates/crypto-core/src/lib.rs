@@ -192,3 +192,65 @@ mod tests {
         assert_ne!(a, b);
     }
 }
+
+impl ServiceKey {
+    /// Proofs for session operations have their own signing domain. The
+    /// service binding is enforced before the signature is created.
+    pub fn sign_session(
+        &self,
+        request: &aitanti_protocol::SessionProofRequest,
+    ) -> Result<Vec<u8>, CryptoError> {
+        if request.service() != self.service {
+            return Err(CryptoError::ServiceMismatch {
+                expected: self.service.clone(),
+                actual: request.service().to_owned(),
+            });
+        }
+        let rng = SystemRandom::new();
+        let signature = self
+            .key_pair
+            .sign(&rng, &request.signing_bytes())
+            .map_err(|_| CryptoError::SigningFailed)?;
+        Ok(signature.as_ref().to_vec())
+    }
+}
+
+pub fn verify_session_signature(
+    public_key_sec1: &[u8],
+    request: &aitanti_protocol::SessionProofRequest,
+    signature: &[u8],
+) -> Result<(), CryptoError> {
+    let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, public_key_sec1);
+    public_key
+        .verify(&request.signing_bytes(), signature)
+        .map_err(|_| CryptoError::VerificationFailed)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use aitanti_protocol::{PROTOCOL_VERSION, SessionProofRequest};
+
+    #[test]
+    fn session_signature_has_distinct_domain_from_authentication() {
+        let key = ServiceKey::generate("service-a.local").expect("key");
+        let auth =
+            AuthRequest::new(PROTOCOL_VERSION, "service-a.local".into(), [3; 32]).expect("auth");
+        let session = SessionProofRequest::new(
+            PROTOCOL_VERSION,
+            "service-a.local".into(),
+            [1; 32],
+            "transfer".into(),
+            [3; 32],
+        )
+        .expect("session");
+        let auth_sig = key.sign_auth(&auth).expect("auth sig");
+        let session_sig = key.sign_session(&session).expect("session sig");
+        assert_eq!(
+            verify_session_signature(&key.public_key_sec1(), &session, &auth_sig),
+            Err(CryptoError::VerificationFailed)
+        );
+        verify_session_signature(&key.public_key_sec1(), &session, &session_sig)
+            .expect("valid session proof");
+    }
+}

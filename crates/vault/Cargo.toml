@@ -3,5 +3,14 @@ name = "aitanti-vault"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
+argon2 = "0.6.0"
+aws-lc-rs = "1.18.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zeroize = "1.9.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
