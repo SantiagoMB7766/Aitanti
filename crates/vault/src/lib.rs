@@ -186,10 +186,14 @@ fn aes_key(bytes: &[u8]) -> Result<LessSafeKey, VaultError> {
 /// Encrypts into a self-contained, authenticated binary envelope.
 /// Its public header (magic, format, salt, nonce) is AEAD-authenticated.
 pub fn seal(profile: &Profile, passphrase: &str) -> Result<Vec<u8>, VaultError> {
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::fill(&mut salt).map_err(|_| VaultError::Random)?;
-    rand::fill(&mut nonce).map_err(|_| VaultError::Random)?;
+    // Generate both values with the crypto RNG; no fixed-value salt/nonce.
+    let rng = rand::SystemRandom::new();
+    let salt: [u8; SALT_LEN] = rand::generate(&rng)
+        .map_err(|_| VaultError::Random)?
+        .expose();
+    let nonce: [u8; NONCE_LEN] = rand::generate(&rng)
+        .map_err(|_| VaultError::Random)?
+        .expose();
 
     let mut header = Vec::with_capacity(HEADER_LEN);
     header.extend_from_slice(MAGIC);
@@ -224,9 +228,11 @@ pub fn open(blob: &[u8], passphrase: &str) -> Result<Profile, VaultError> {
     {
         return Err(VaultError::InvalidFormat);
     }
-    let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&blob[10..10 + SALT_LEN]);
-    let key_material = derive_key(passphrase, &salt)?;
+    // The salt comes from the file header; authentication is checked by AEAD.
+    let salt: &[u8; SALT_LEN] = (&blob[10..10 + SALT_LEN])
+        .try_into()
+        .map_err(|_| VaultError::InvalidFormat)?;
+    let key_material = derive_key(passphrase, salt)?;
     let key = aes_key(&*key_material)?;
     let nonce = Nonce::try_assume_unique_for_key(&blob[10 + SALT_LEN..HEADER_LEN])
         .map_err(|_| VaultError::InvalidFormat)?;
@@ -360,10 +366,19 @@ mod tests {
     }
 
     #[test]
+    fn modified_salt_is_rejected() {
+        let mut blob = seal(&Profile::fictitious(), PASS).expect("seal");
+        blob[10] ^= 1;
+        assert!(matches!(open(&blob, PASS), Err(VaultError::UnlockFailed)));
+    }
+
+    #[test]
     fn distinct_encryptions_use_distinct_salts_and_nonces() {
         let a = seal(&Profile::fictitious(), PASS).expect("a");
         let b = seal(&Profile::fictitious(), PASS).expect("b");
         assert_ne!(a, b);
+        assert_ne!(&a[10..10 + SALT_LEN], &b[10..10 + SALT_LEN]);
+        assert_ne!(&a[10 + SALT_LEN..HEADER_LEN], &b[10 + SALT_LEN..HEADER_LEN],);
     }
 
     #[test]
