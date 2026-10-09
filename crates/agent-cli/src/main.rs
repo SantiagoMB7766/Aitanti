@@ -1,4 +1,6 @@
-//! Aitanti offline demos. No HTTP, telemetry, production keys or real data.
+//! Aitanti CLI: offline and local HTTP demonstrations using fictitious data.
+
+mod http_demo;
 
 use std::{
     env,
@@ -112,11 +114,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<String> = env::args().collect();
     match arguments.as_slice() {
         [_program, command] if command == "demo" => run_demo(),
+        [_program, command] if command == "http-demo" => http_demo::run(),
         [_program, command, path] if command == "vault-init" => create_vault(Path::new(path)),
         [_program, command, path] if command == "vault-check" => check_vault(Path::new(path)),
         _ => {
             println!(
-                "Usage:\n  aitanti-agent-cli demo\n  aitanti-agent-cli vault-init <path>\n  aitanti-agent-cli vault-check <path>"
+                "Usage:\n  aitanti-agent-cli demo\n  aitanti-agent-cli http-demo\n  aitanti-agent-cli vault-init <path>\n  aitanti-agent-cli vault-check <path>"
             );
             Ok(())
         }

@@ -3,9 +3,12 @@
 //! The server stores public keys, one-time challenges and demo session tokens
 //! in memory only. It never receives or stores client private keys.
 
-use std::collections::{HashMap, HashSet};
+pub mod http;
+
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use aitanti_crypto_core::{
     CryptoError, generate_challenge, verify_auth_signature, verify_session_signature,
@@ -22,6 +25,7 @@ struct PendingChallenge {
 pub enum ServerError {
     EmptyService,
     EmptyPublicKey,
+    InvalidPublicKey,
     ServiceAlreadyRegistered,
     UnregisteredService,
     UnsupportedProtocolVersion { received: u16 },
@@ -30,6 +34,7 @@ pub enum ServerError {
     UnknownSession,
     SessionServiceMismatch,
     SessionChallengeUnknownOrConsumed,
+    CapacityExceeded,
     Protocol(ProtocolError),
     Crypto(CryptoError),
 }
@@ -39,6 +44,7 @@ impl fmt::Display for ServerError {
         match self {
             Self::EmptyService => write!(f, "service identifier cannot be empty"),
             Self::EmptyPublicKey => write!(f, "public key cannot be empty"),
+            Self::InvalidPublicKey => write!(f, "unsupported public key encoding"),
             Self::ServiceAlreadyRegistered => write!(f, "service is already registered"),
             Self::UnregisteredService => write!(f, "service is not registered"),
             Self::UnsupportedProtocolVersion { received } => {
@@ -53,6 +59,7 @@ impl fmt::Display for ServerError {
             Self::SessionChallengeUnknownOrConsumed => {
                 write!(f, "session challenge unknown or already consumed")
             }
+            Self::CapacityExceeded => write!(f, "server demo resource limit reached"),
             Self::Protocol(err) => write!(f, "protocol error: {err}"),
             Self::Crypto(err) => write!(f, "cryptographic error: {err}"),
         }
@@ -73,12 +80,47 @@ impl From<CryptoError> for ServerError {
     }
 }
 
-#[derive(Default)]
+/// Limits for the in-memory demo only. No state survives a server restart.
+#[derive(Debug, Clone)]
+pub struct ServerLimits {
+    pub challenge_ttl: Duration,
+    pub session_ttl: Duration,
+    pub max_services: usize,
+    pub max_pending_auth: usize,
+    pub max_pending_proofs: usize,
+    pub max_sessions: usize,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            challenge_ttl: Duration::from_secs(60),
+            session_ttl: Duration::from_secs(600),
+            max_services: 32,
+            max_pending_auth: 256,
+            max_pending_proofs: 256,
+            max_sessions: 128,
+        }
+    }
+}
+
+struct SessionRecord {
+    service: String,
+    expires_at: Instant,
+}
+
 pub struct MockServer {
     public_keys: HashMap<String, Vec<u8>>,
-    pending_challenges: HashSet<PendingChallenge>,
-    sessions: HashMap<[u8; 32], String>,
-    pending_session_proofs: HashSet<SessionChallenge>,
+    pending_challenges: HashMap<PendingChallenge, Instant>,
+    sessions: HashMap<[u8; 32], SessionRecord>,
+    pending_session_proofs: HashMap<SessionChallenge, Instant>,
+    limits: ServerLimits,
+}
+
+impl Default for MockServer {
+    fn default() -> Self {
+        Self::with_limits(ServerLimits::default())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -92,6 +134,26 @@ impl MockServer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_limits(limits: ServerLimits) -> Self {
+        Self {
+            public_keys: HashMap::new(),
+            pending_challenges: HashMap::new(),
+            sessions: HashMap::new(),
+            pending_session_proofs: HashMap::new(),
+            limits,
+        }
+    }
+
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.pending_challenges
+            .retain(|_, expires_at| *expires_at > now);
+        self.sessions.retain(|_, record| record.expires_at > now);
+        self.pending_session_proofs
+            .retain(|key, expires_at| *expires_at > now && self.sessions.contains_key(&key.token));
     }
 
     /// Registers the public key for a service identity.
@@ -111,18 +173,30 @@ impl MockServer {
         if public_key_sec1.is_empty() {
             return Err(ServerError::EmptyPublicKey);
         }
+        // Aitanti MVP uses uncompressed P-256 SEC1 only; curve validity is
+        // subsequently checked by the verifier during authentication.
+        if public_key_sec1.len() != 65 || public_key_sec1[0] != 0x04 {
+            return Err(ServerError::InvalidPublicKey);
+        }
         if self.public_keys.contains_key(&service) {
             return Err(ServerError::ServiceAlreadyRegistered);
         }
 
+        if self.public_keys.len() >= self.limits.max_services {
+            return Err(ServerError::CapacityExceeded);
+        }
         self.public_keys.insert(service, public_key_sec1);
         Ok(())
     }
 
     /// Issues a fresh challenge bound to one registered service.
     pub fn issue_challenge(&mut self, service: &str) -> Result<AuthRequest, ServerError> {
+        self.prune_expired();
         if !self.public_keys.contains_key(service) {
             return Err(ServerError::UnregisteredService);
+        }
+        if self.pending_challenges.len() >= self.limits.max_pending_auth {
+            return Err(ServerError::CapacityExceeded);
         }
 
         // A collision is astronomically unlikely, but we still avoid silently
@@ -135,7 +209,10 @@ impl MockServer {
                 challenge,
             };
 
-            if self.pending_challenges.insert(pending) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.pending_challenges.entry(pending)
+            {
+                entry.insert(Instant::now() + self.limits.challenge_ttl);
                 return AuthRequest::new(PROTOCOL_VERSION, service.to_owned(), challenge)
                     .map_err(ServerError::from);
             }
@@ -151,6 +228,7 @@ impl MockServer {
         request: &AuthRequest,
         signature: &[u8],
     ) -> Result<(), ServerError> {
+        self.prune_expired();
         if request.version() != PROTOCOL_VERSION {
             return Err(ServerError::UnsupportedProtocolVersion {
                 received: request.version(),
@@ -167,7 +245,7 @@ impl MockServer {
             challenge: request.challenge(),
         };
 
-        if !self.pending_challenges.contains(&pending) {
+        if !self.pending_challenges.contains_key(&pending) {
             return Err(ServerError::ChallengeUnknownOrConsumed);
         }
 
@@ -189,11 +267,18 @@ impl MockServer {
         request: &AuthRequest,
         signature: &[u8],
     ) -> Result<[u8; 32], ServerError> {
+        self.prune_expired();
+        if self.sessions.len() >= self.limits.max_sessions {
+            return Err(ServerError::CapacityExceeded);
+        }
         self.verify_auth(request, signature)?;
         for _ in 0..3 {
             let token = generate_challenge().map_err(|_| ServerError::ChallengeGenerationFailed)?;
             if let std::collections::hash_map::Entry::Vacant(entry) = self.sessions.entry(token) {
-                entry.insert(request.service().to_owned());
+                entry.insert(SessionRecord {
+                    service: request.service().to_owned(),
+                    expires_at: Instant::now() + self.limits.session_ttl,
+                });
                 return Ok(token);
             }
         }
@@ -203,11 +288,12 @@ impl MockServer {
     /// Ends a demo session and invalidates all unused operation challenges.
     /// A revoked session token cannot authorize an action, even with a signature.
     pub fn revoke_session(&mut self, token: [u8; 32]) -> Result<(), ServerError> {
+        self.prune_expired();
         self.sessions
             .remove(&token)
             .ok_or(ServerError::UnknownSession)?;
         self.pending_session_proofs
-            .retain(|challenge| challenge.token != token);
+            .retain(|challenge, _| challenge.token != token);
         Ok(())
     }
 
@@ -217,11 +303,16 @@ impl MockServer {
         token: [u8; 32],
         action: &str,
     ) -> Result<SessionProofRequest, ServerError> {
+        self.prune_expired();
         let service = self
             .sessions
             .get(&token)
             .ok_or(ServerError::UnknownSession)?
+            .service
             .clone();
+        if self.pending_session_proofs.len() >= self.limits.max_pending_proofs {
+            return Err(ServerError::CapacityExceeded);
+        }
         for _ in 0..3 {
             let challenge =
                 generate_challenge().map_err(|_| ServerError::ChallengeGenerationFailed)?;
@@ -232,11 +323,14 @@ impl MockServer {
                 action.to_owned(),
                 challenge,
             )?;
-            if self.pending_session_proofs.insert(SessionChallenge {
-                token,
-                action: action.to_owned(),
-                challenge,
-            }) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.pending_session_proofs.entry(SessionChallenge {
+                    token,
+                    action: action.to_owned(),
+                    challenge,
+                })
+            {
+                entry.insert(Instant::now() + self.limits.challenge_ttl);
                 return Ok(request);
             }
         }
@@ -250,6 +344,7 @@ impl MockServer {
         request: &SessionProofRequest,
         signature: &[u8],
     ) -> Result<(), ServerError> {
+        self.prune_expired();
         if request.version() != PROTOCOL_VERSION {
             return Err(ServerError::UnsupportedProtocolVersion {
                 received: request.version(),
@@ -259,7 +354,7 @@ impl MockServer {
             .sessions
             .get(&request.token())
             .ok_or(ServerError::UnknownSession)?;
-        if registered_service != request.service() {
+        if registered_service.service != request.service() {
             return Err(ServerError::SessionServiceMismatch);
         }
         let pending = SessionChallenge {
@@ -267,7 +362,7 @@ impl MockServer {
             action: request.action().to_owned(),
             challenge: request.challenge(),
         };
-        if !self.pending_session_proofs.contains(&pending) {
+        if !self.pending_session_proofs.contains_key(&pending) {
             return Err(ServerError::SessionChallengeUnknownOrConsumed);
         }
         let public_key = self
@@ -470,6 +565,126 @@ mod revocation_tests {
         assert_eq!(
             server.issue_session_challenge(token, "transfer"),
             Err(ServerError::UnknownSession)
+        );
+    }
+}
+
+#[cfg(test)]
+mod expiration_and_limit_tests {
+    use super::*;
+    use aitanti_crypto_core::ServiceKey;
+
+    #[test]
+    fn expired_authentication_challenge_is_rejected() {
+        let key = ServiceKey::generate("service-a.local").expect("key");
+        let mut server = MockServer::with_limits(ServerLimits {
+            challenge_ttl: Duration::ZERO,
+            ..ServerLimits::default()
+        });
+        server
+            .register_service("service-a.local", key.public_key_sec1())
+            .expect("register");
+        let challenge = server.issue_challenge("service-a.local").expect("issue");
+        let signature = key.sign_auth(&challenge).expect("sign");
+        assert_eq!(
+            server.verify_auth(&challenge, &signature),
+            Err(ServerError::ChallengeUnknownOrConsumed)
+        );
+    }
+
+    #[test]
+    fn zero_ttl_session_cannot_authorize_sensitive_action() {
+        let key = ServiceKey::generate("service-a.local").expect("key");
+        let mut server = MockServer::with_limits(ServerLimits {
+            session_ttl: Duration::ZERO,
+            ..ServerLimits::default()
+        });
+        server
+            .register_service("service-a.local", key.public_key_sec1())
+            .expect("register");
+        let challenge = server.issue_challenge("service-a.local").expect("issue");
+        let token = server
+            .login(&challenge, &key.sign_auth(&challenge).expect("sign"))
+            .expect("login");
+        assert_eq!(
+            server.issue_session_challenge(token, "sensitive-demo-action"),
+            Err(ServerError::UnknownSession)
+        );
+    }
+
+    #[test]
+    fn pending_authentication_challenges_have_hard_limit() {
+        let key = ServiceKey::generate("service-a.local").expect("key");
+        let mut server = MockServer::with_limits(ServerLimits {
+            max_pending_auth: 1,
+            ..ServerLimits::default()
+        });
+        server
+            .register_service("service-a.local", key.public_key_sec1())
+            .expect("register");
+        let first = server.issue_challenge("service-a.local").expect("issue");
+        assert_eq!(
+            server.issue_challenge("service-a.local"),
+            Err(ServerError::CapacityExceeded)
+        );
+        server
+            .verify_auth(&first, &key.sign_auth(&first).expect("sign"))
+            .expect("verify");
+        server
+            .issue_challenge("service-a.local")
+            .expect("capacity recycled");
+    }
+
+    #[test]
+    fn registration_is_bounded_and_rejects_non_sec1_keys() {
+        let key_a = ServiceKey::generate("service-a.local").expect("key a");
+        let key_b = ServiceKey::generate("service-b.local").expect("key b");
+        let mut server = MockServer::with_limits(ServerLimits {
+            max_services: 1,
+            ..ServerLimits::default()
+        });
+        assert_eq!(
+            server.register_service("bad.local", vec![3; 32]),
+            Err(ServerError::InvalidPublicKey)
+        );
+        server
+            .register_service("service-a.local", key_a.public_key_sec1())
+            .expect("first registration");
+        assert_eq!(
+            server.register_service("service-b.local", key_b.public_key_sec1()),
+            Err(ServerError::CapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn expired_pending_proof_does_not_authorize_action() {
+        let key = ServiceKey::generate("service-a.local").expect("key");
+        let mut server = MockServer::new();
+        server
+            .register_service("service-a.local", key.public_key_sec1())
+            .expect("register");
+        let auth = server
+            .issue_challenge("service-a.local")
+            .expect("challenge");
+        let token = server
+            .login(&auth, &key.sign_auth(&auth).expect("sign"))
+            .expect("login");
+        let proof = server
+            .issue_session_challenge(token, "sensitive-demo-action")
+            .expect("proof");
+        // Drive the timeout to zero after issuing the challenge, without sleeping.
+        server.limits.challenge_ttl = Duration::ZERO;
+        server.pending_session_proofs.insert(
+            SessionChallenge {
+                token,
+                action: proof.action().to_owned(),
+                challenge: proof.challenge(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(
+            server.execute_sensitive(&proof, &key.sign_session(&proof).expect("sign")),
+            Err(ServerError::SessionChallengeUnknownOrConsumed)
         );
     }
 }
