@@ -173,3 +173,48 @@ async fn web_origins_and_missing_client_header_are_denied() -> Result<(), Box<dy
     task.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn re_enrollment_requires_exact_same_key() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            aitanti_mock_server::http::router(MockServer::new()),
+        )
+        .await
+    });
+    let base = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let legitimate = ServiceKey::generate("service-a.local")?;
+    let attacker = ServiceKey::generate("service-a.local")?;
+    let register = |key: &ServiceKey| ServiceRegistration {
+        service: "service-a.local".into(),
+        public_key: key.public_key_sec1(),
+    };
+    for _ in 0..2 {
+        assert!(
+            client
+                .post(format!("{base}/v1/register"))
+                .header("x-aitanti-demo-client", "1")
+                .json(&register(&legitimate))
+                .send()
+                .await?
+                .status()
+                .is_success()
+        );
+    }
+    assert_eq!(
+        client
+            .post(format!("{base}/v1/register"))
+            .header("x-aitanti-demo-client", "1")
+            .json(&register(&attacker))
+            .send()
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    task.abort();
+    Ok(())
+}

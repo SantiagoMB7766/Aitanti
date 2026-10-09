@@ -26,3 +26,6 @@ local-data/
 # Logs must never contain secrets; keep runtime logs out of Git anyway
 *.log
 logs/
+
+# Local encrypted signing-key files (never add to Git)
+*.aitk

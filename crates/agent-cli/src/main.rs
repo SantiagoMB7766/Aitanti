@@ -10,7 +10,7 @@ use std::{
 };
 
 use aitanti_agent_core::{Attribute, DisclosureRequest, ReleasedAttribute, UserDecision, disclose};
-use aitanti_crypto_core::ServiceKey;
+use aitanti_crypto_core::{ServiceKey, identity_store::IdentityStore};
 use aitanti_mock_server::MockServer;
 use aitanti_vault::{Date, Profile, create_new, open, read_file, seal};
 use zeroize::Zeroizing;
@@ -110,16 +110,54 @@ fn check_vault(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn create_demo_keys(path: &Path) -> Result<(), Box<dyn Error>> {
+    let first = password("New demo identity-store passphrase (12+ bytes): ")?;
+    let second = password("Repeat passphrase: ")?;
+    if first.as_str() != second.as_str() {
+        return Err("passphrases do not match".into());
+    }
+    IdentityStore::fixture()?.create_new(path, &first)?;
+    println!("Demo identities saved encrypted; no private key material printed.");
+    Ok(())
+}
+
+fn check_demo_keys(path: &Path) -> Result<(), Box<dyn Error>> {
+    let passphrase = password("Demo identity-store passphrase: ")?;
+    let identities = IdentityStore::unlock(path, &passphrase)?;
+    let a = identities.identity("service-a.local")?;
+    let b = identities.identity("service-b.local")?;
+    if a.public_key_sec1() == b.public_key_sec1() {
+        return Err("per-service identities are not distinct".into());
+    }
+    println!("Two distinct fixture identities restored from encrypted storage.");
+    Ok(())
+}
+
+fn persistent_http_demo(path: &Path) -> Result<(), Box<dyn Error>> {
+    let passphrase = password("Demo identity-store passphrase: ")?;
+    let identities = IdentityStore::unlock(path, &passphrase)?;
+    http_demo::run_with_keys(
+        identities.identity("service-a.local")?,
+        identities.identity("service-b.local")?,
+    )
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<String> = env::args().collect();
     match arguments.as_slice() {
         [_program, command] if command == "demo" => run_demo(),
         [_program, command] if command == "http-demo" => http_demo::run(),
+        [_program, command, path] if command == "keys-init" => create_demo_keys(Path::new(path)),
+        [_program, command, path] if command == "keys-check" => check_demo_keys(Path::new(path)),
+        [_program, command, path] if command == "http-demo-persistent" => {
+            persistent_http_demo(Path::new(path))
+        }
+
         [_program, command, path] if command == "vault-init" => create_vault(Path::new(path)),
         [_program, command, path] if command == "vault-check" => check_vault(Path::new(path)),
         _ => {
             println!(
-                "Usage:\n  aitanti-agent-cli demo\n  aitanti-agent-cli http-demo\n  aitanti-agent-cli vault-init <path>\n  aitanti-agent-cli vault-check <path>"
+                "Usage:\n  aitanti-agent-cli demo\n  aitanti-agent-cli http-demo\n  aitanti-agent-cli vault-init <path>\n  aitanti-agent-cli vault-check <path>\n  aitanti-agent-cli keys-init <path>\n  aitanti-agent-cli keys-check <path>\n  aitanti-agent-cli http-demo-persistent <path>"
             );
             Ok(())
         }

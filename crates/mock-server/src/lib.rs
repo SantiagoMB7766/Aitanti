@@ -178,8 +178,13 @@ impl MockServer {
         if public_key_sec1.len() != 65 || public_key_sec1[0] != 0x04 {
             return Err(ServerError::InvalidPublicKey);
         }
-        if self.public_keys.contains_key(&service) {
-            return Err(ServerError::ServiceAlreadyRegistered);
+        if let Some(existing) = self.public_keys.get(&service) {
+            // Same key: allow agent restarts. Different key: never replace silently.
+            return if existing == &public_key_sec1 {
+                Ok(())
+            } else {
+                Err(ServerError::ServiceAlreadyRegistered)
+            };
         }
 
         if self.public_keys.len() >= self.limits.max_services {
@@ -438,6 +443,24 @@ mod tests {
             server.issue_challenge("service-a.local"),
             Err(ServerError::UnregisteredService)
         );
+    }
+
+    #[test]
+    fn repeated_registration_with_same_public_key_is_safe() {
+        let key = ServiceKey::generate("service-a.local").expect("key");
+        let mut server = MockServer::new();
+        server
+            .register_service("service-a.local", key.public_key_sec1())
+            .expect("first");
+        server
+            .register_service("service-a.local", key.public_key_sec1())
+            .expect("repeat");
+        let challenge = server
+            .issue_challenge("service-a.local")
+            .expect("challenge");
+        server
+            .verify_auth(&challenge, &key.sign_auth(&challenge).expect("sign"))
+            .expect("original key still authenticates");
     }
 
     #[test]
