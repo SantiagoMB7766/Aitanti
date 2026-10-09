@@ -3,6 +3,8 @@
 //! This crate deliberately exposes narrow operations instead of raw private
 //! key material. Private keys remain inside [`ServiceKey`].
 
+pub mod identity_store;
+
 use std::error::Error;
 use std::fmt;
 
@@ -48,7 +50,7 @@ impl Error for CryptoError {}
 /// There is intentionally no method which exports the private key.
 pub struct ServiceKey {
     service: String,
-    key_pair: EcdsaKeyPair,
+    pub(crate) key_pair: EcdsaKeyPair,
 }
 
 impl ServiceKey {

@@ -5,6 +5,8 @@
 //! There is no plaintext key or passphrase in the serialized vault file.
 //! This file format is intentionally frozen as a demo format, NOT production.
 
+pub mod private_store;
+
 use std::{
     error::Error,
     fmt,

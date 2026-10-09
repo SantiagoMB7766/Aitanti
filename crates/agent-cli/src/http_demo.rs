@@ -1,4 +1,4 @@
-//! Explicit, non-persistent loopback-only demonstration of the external protocol.
+//! Loopback-only demonstration; can use ephemeral or encrypted persistent identities.
 use std::{error::Error, time::Duration};
 
 use aitanti_crypto_core::ServiceKey;
@@ -12,6 +12,13 @@ use reqwest::{StatusCode, blocking::Client};
 const BASE: &str = "http://127.0.0.1:8787";
 
 pub fn run() -> Result<(), Box<dyn Error>> {
+    let key_a = ServiceKey::generate("service-a.local")?;
+    let key_b = ServiceKey::generate("service-b.local")?;
+    run_with_keys(&key_a, &key_b)
+}
+
+/// Use existing decrypted keys; no re-enrollment with a new identity.
+pub fn run_with_keys(key_a: &ServiceKey, key_b: &ServiceKey) -> Result<(), Box<dyn Error>> {
     let client = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -25,13 +32,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Err("demo server not healthy".into());
     }
 
-    let key_a = ServiceKey::generate("service-a.local")?;
-    let key_b = ServiceKey::generate("service-b.local")?;
     if key_a.public_key_sec1() == key_b.public_key_sec1() {
         return Err("identity separation failed".into());
     }
 
-    for key in [&key_a, &key_b] {
+    for key in [key_a, key_b] {
         client
             .post(format!("{BASE}/v1/register"))
             .header("x-aitanti-demo-client", "1")
@@ -145,6 +150,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     if revoked.status() != StatusCode::UNAUTHORIZED {
         return Err("revoked session accepted".into());
     }
-    println!("HTTP: logout revoked the session; no private keys or tokens persisted.");
+    println!("HTTP: logout revoked the session; no session tokens persisted.");
     Ok(())
 }

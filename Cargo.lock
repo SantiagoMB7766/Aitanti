@@ -28,7 +28,10 @@ name = "aitanti-crypto-core"
 version = "0.1.0"
 dependencies = [
  "aitanti-protocol",
+ "aitanti-vault",
  "aws-lc-rs",
+ "tempfile",
+ "zeroize",
 ]
 
 [[package]]
